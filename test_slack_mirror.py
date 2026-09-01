@@ -91,6 +91,19 @@ class MutableSource(FakeSource):
         }
 
 
+class GrowingSource(FakeSource):
+    def __init__(self):
+        self.channels = [
+            {"id": "C1", "is_im": False, "is_mpim": False, "name": "general"}
+        ]
+
+    def users_conversations(self, **kwargs):
+        return {
+            "channels": list(self.channels),
+            "response_metadata": {"next_cursor": ""},
+        }
+
+
 class ThreadSource(FakeSource):
     def __init__(self):
         self.history_visible = True
@@ -294,6 +307,30 @@ class SlackMirrorTests(unittest.TestCase):
             self.assertEqual(len(destination.posts), 1)
             self.assertEqual(len(destination.updates), 1)
             self.assertIn("edited", destination.updates[0]["text"])
+
+    def test_newly_joined_channel_is_discovered_and_backfilled_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = GrowingSource()
+            destination = FakeDestination()
+            state = State(Path(directory) / "state.sqlite3")
+            mirror = Mirror(
+                source,
+                destination,
+                state,
+                source_team_name="Source Workspace",
+                source_user_id="ME",
+                post_interval=0,
+            )
+            mirror.sync_all()
+            source.channels.append(
+                {"id": "C2", "is_im": False, "is_mpim": False, "name": "new-room"}
+            )
+
+            mirror.sync_new_conversations()
+            mirror.sync_new_conversations()
+
+            self.assertEqual(state.conversation("C2")["destination_name"], "new-room")
+            self.assertEqual(len(destination.posts), 2)
 
     def test_refresh_recovers_reply_to_known_thread(self):
         with tempfile.TemporaryDirectory() as directory:

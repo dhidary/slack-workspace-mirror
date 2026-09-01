@@ -65,8 +65,8 @@ SLACK_ARCHIVE_DIR='./slack-archive'
 
 `dry-run` should list the conversations it can access. `once` creates the
 archive; open `slack-archive/index.html` in a browser to check it. `watch` saves
-future activity and must remain running. Restart it whenever the computer
-restarts.
+future activity, automatically backfills newly joined conversations, and must
+remain running. Restart it whenever the computer restarts.
 
 The source token can only copy conversations accessible to its Slack user.
 Messages and files that Slack has already hidden or deleted cannot be recovered.

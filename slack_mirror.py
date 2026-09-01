@@ -657,6 +657,24 @@ class Mirror:
                     code,
                 )
 
+    def sync_new_conversations(self) -> None:
+        for conversation in self.conversations():
+            if self.state.conversation(conversation["id"]):
+                continue
+            LOG.info("Discovered new source conversation %s", conversation["id"])
+            try:
+                self.sync_conversation(conversation)
+            except Exception as error:
+                response = getattr(error, "response", None)
+                code = response.get("error") if response else None
+                if code not in {"channel_not_found", "not_in_channel"}:
+                    raise
+                LOG.warning(
+                    "Skipping inaccessible source conversation %s (%s)",
+                    conversation["id"],
+                    code,
+                )
+
     def handle_event(self, event: dict[str, Any]) -> None:
         if event.get("type") != "message":
             return
@@ -1157,6 +1175,10 @@ class CompositeMirror:
         for mirror in self.mirrors:
             mirror.sync_all(refresh=refresh)
 
+    def sync_new_conversations(self) -> None:
+        for mirror in self.mirrors:
+            mirror.sync_new_conversations()
+
     def handle_event(self, event: dict[str, Any]) -> None:
         for mirror in self.mirrors:
             mirror.handle_event(event)
@@ -1287,8 +1309,16 @@ def main() -> int:
     socket_client.connect()
     LOG.info("Live mirroring is connected. Press Ctrl-C to stop.")
     mirror.sync_all(refresh=True)
+    rescan_interval = float(os.environ.get("SLACK_RESCAN_INTERVAL", "60"))
+    if rescan_interval <= 0:
+        raise SystemExit("SLACK_RESCAN_INTERVAL must be greater than zero.")
+    stop_event = threading.Event()
     try:
-        threading.Event().wait()
+        while not stop_event.wait(rescan_interval):
+            try:
+                mirror.sync_new_conversations()
+            except Exception:
+                LOG.exception("Failed to check for new Slack conversations")
     except KeyboardInterrupt:
         LOG.info("Stopping")
     finally:
