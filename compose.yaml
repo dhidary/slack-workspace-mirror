@@ -1,0 +1,12 @@
+services:
+  slack-mirror:
+    build: .
+    restart: unless-stopped
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    env_file: mirror.env
+    environment:
+      SLACK_ARCHIVE_DIR: /data/archive
+      SLACK_LOCAL_MIRROR_DB: /data/archive/.slack-mirror.sqlite3
+      SLACK_MIRROR_DB: /data/archive/.slack-destination-mirror.sqlite3
+    volumes:
+      - ./slack-archive:/data/archive

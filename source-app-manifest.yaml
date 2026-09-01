@@ -1,0 +1,28 @@
+_metadata:
+  major_version: 2
+display_information:
+  name: Slack Workspace Mirror Source
+  description: Reads authorized conversations for a private Slack mirror.
+oauth_config:
+  scopes:
+    user:
+      - channels:history
+      - channels:read
+      - files:read
+      - groups:history
+      - groups:read
+      - im:history
+      - im:read
+      - mpim:history
+      - mpim:read
+      - users:read
+settings:
+  event_subscriptions:
+    user_events:
+      - message.channels
+      - message.groups
+      - message.im
+      - message.mpim
+  org_deploy_enabled: false
+  socket_mode_enabled: true
+  token_rotation_enabled: false
