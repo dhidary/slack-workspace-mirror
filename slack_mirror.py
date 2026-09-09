@@ -8,13 +8,16 @@ import hashlib
 import html
 import json
 import logging
+import math
 import os
+import queue
 import re
 import sqlite3
 import tempfile
 import threading
 import time
 import urllib.request
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -99,6 +102,19 @@ class State:
 
     def close(self) -> None:
         self.connection.close()
+
+    def get_meta(self, key: str) -> str | None:
+        with self.lock:
+            row = self.connection.execute(
+                "SELECT value FROM meta WHERE key = ?", (key,)
+            ).fetchone()
+            return row["value"] if row else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        with self.lock, self.connection:
+            self.connection.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", (key, value)
+            )
 
     def __del__(self) -> None:
         try:
@@ -271,6 +287,16 @@ class Mirror:
         self.destination_channels: dict[str, str] | None = None
         self.copy_lock = threading.RLock()
         self.last_post = 0.0
+        self.destination_validated = False
+
+    def prepare(self) -> None:
+        source_team = self.state.get_meta("source_team_id")
+        if self.destination and source_team and not self.destination_validated:
+            auth = self.destination.auth_test()
+            if auth["team_id"] == source_team:
+                raise RuntimeError("Source and destination must be different workspaces")
+            self.state.validate_workspace("destination_team_id", auth["team_id"])
+            self.destination_validated = True
 
     @staticmethod
     def paginate(
@@ -584,13 +610,10 @@ class Mirror:
     def sync_conversation(
         self, conversation: dict[str, Any], refresh: bool = False
     ) -> None:
+        self.prepare()
         mapped = self.state.conversation(conversation["id"])
         oldest = None if refresh else (mapped["last_history_ts"] if mapped else None)
         messages = self.history(conversation["id"], oldest=oldest)
-        if not messages and not refresh:
-            self.destination_channel(conversation)
-            return
-
         roots = [
             message
             for message in messages
@@ -634,6 +657,11 @@ class Mirror:
             self.state.update_history_ts(conversation["id"], latest)
         else:
             self.destination_channel(conversation)
+            if not mapped or not mapped["last_history_ts"]:
+                self.state.update_history_ts(conversation["id"], "0")
+        self.state.set_meta(f"last_sync:{conversation['id']}", str(time.time()))
+        if refresh:
+            self.state.set_meta(f"last_refresh:{conversation['id']}", str(time.time()))
 
     def sync_all(self, refresh: bool = False) -> None:
         conversations = self.conversations()
@@ -657,23 +685,23 @@ class Mirror:
                     code,
                 )
 
-    def sync_new_conversations(self) -> None:
-        for conversation in self.conversations():
-            if self.state.conversation(conversation["id"]):
-                continue
-            LOG.info("Discovered new source conversation %s", conversation["id"])
-            try:
-                self.sync_conversation(conversation)
-            except Exception as error:
-                response = getattr(error, "response", None)
-                code = response.get("error") if response else None
-                if code not in {"channel_not_found", "not_in_channel"}:
-                    raise
-                LOG.warning(
-                    "Skipping inaccessible source conversation %s (%s)",
-                    conversation["id"],
-                    code,
-                )
+    def sync_new_conversations(self) -> list[dict[str, Any]]:
+        conversations = self.conversations()
+        accessible = []
+        for conversation in conversations:
+            mapped = self.state.conversation(conversation["id"])
+            if not mapped or mapped["last_history_ts"] is None:
+                try:
+                    self.sync_conversation(conversation, refresh=True)
+                except Exception as error:
+                    response = getattr(error, "response", None)
+                    code = response.get("error") if response else None
+                    if code not in {"channel_not_found", "not_in_channel"}:
+                        raise
+                    LOG.warning("Skipping an inaccessible conversation (%s)", code)
+                    continue
+            accessible.append(conversation)
+        return accessible
 
     def handle_event(self, event: dict[str, Any]) -> None:
         if event.get("type") != "message":
@@ -681,6 +709,7 @@ class Mirror:
         channel = event.get("channel")
         if not channel:
             return
+        self.prepare()
         conversation = self.conversation_info(channel)
         subtype = event.get("subtype")
         if subtype == "message_changed":
@@ -726,6 +755,7 @@ class LocalArchive(Mirror):
         )
         self.archive_dir = archive_dir.expanduser().resolve()
         self.defer_html = False
+        self.dirty_conversations: set[Path] = set()
 
     def destination_channel(self, conversation: dict[str, Any]) -> str:
         source_id = conversation["id"]
@@ -764,6 +794,7 @@ class LocalArchive(Mirror):
             encoding="utf-8",
         )
         self.state.save_conversation(source_id, str(path), name, label)
+        self.dirty_conversations.add(path)
         LOG.info("Mapped %s to %s", label, path)
         return str(path)
 
@@ -905,7 +936,7 @@ class LocalArchive(Mirror):
         return f'<a class="attachment" href="{relative}">{preview}<span>{name}</span></a>'
 
     @staticmethod
-    def write_html(path: Path, content: str) -> None:
+    def write_atomic(path: Path, content: str) -> None:
         temporary = path.with_suffix(path.suffix + ".tmp")
         temporary.write_text(content, encoding="utf-8")
         temporary.replace(path)
@@ -985,7 +1016,7 @@ messageSearch.addEventListener("input",()=>{{
   messageSearchStatus.textContent=query?`${{visible}} of ${{archivedMessages.length}} messages`:"";
 }});
 </script></body></html>"""
-        self.write_html(conversation_dir / "index.html", page)
+        self.write_atomic(conversation_dir / "index.html", page)
 
     def write_archive_index(self) -> None:
         rows: list[str] = []
@@ -1026,7 +1057,7 @@ conversationSearch.addEventListener("input",()=>{{
 }});
 </script></body></html>"""
         self.archive_dir.mkdir(parents=True, exist_ok=True)
-        self.write_html(self.archive_dir / "index.html", page)
+        self.write_atomic(self.archive_dir / "index.html", page)
 
     def copy_message(
         self,
@@ -1048,24 +1079,28 @@ conversationSearch.addEventListener("input",()=>{{
             if source_thread_ts and source_thread_ts != source_ts:
                 self.ensure_thread_parent(conversation, source_thread_ts)
 
+            fingerprint = message_fingerprint(message)
+            mapped = self.state.message(source_channel, source_ts)
+            changed = (
+                not mapped or mapped["source_fingerprint"] != fingerprint
+                or not self.message_path(conversation_dir, source_ts).exists()
+            )
             record = {
                 "source_workspace": self.source_team_name,
                 "source_conversation": source_channel,
                 "author": self.author_name(message),
                 "message": message,
             }
-            self.message_path(conversation_dir, source_ts).write_text(
-                json.dumps(record, indent=2, ensure_ascii=False) + "\n",
-                encoding="utf-8",
-            )
-            self.state.save_message(
-                source_channel,
-                source_ts,
-                source_thread_ts,
-                str(conversation_dir),
-                source_ts,
-                message_fingerprint(message),
-            )
+            if changed:
+                self.dirty_conversations.add(conversation_dir)
+                self.write_atomic(
+                    self.message_path(conversation_dir, source_ts),
+                    json.dumps(record, indent=2, ensure_ascii=False) + "\n",
+                )
+                self.state.save_message(
+                    source_channel, source_ts, source_thread_ts,
+                    str(conversation_dir), source_ts, fingerprint,
+                )
             for file_info in message.get("files", []):
                 self.copy_file(
                     source_channel,
@@ -1076,8 +1111,14 @@ conversationSearch.addEventListener("input",()=>{{
                     self.author_name(message),
                 )
             if not self.defer_html:
-                self.write_conversation_html(conversation_dir)
-                self.write_archive_index()
+                self.flush_html()
+
+    def flush_html(self) -> None:
+        if self.dirty_conversations:
+            for path in self.dirty_conversations:
+                self.write_conversation_html(path)
+            self.write_archive_index()
+            self.dirty_conversations.clear()
 
     def copy_file(
         self,
@@ -1113,12 +1154,13 @@ conversationSearch.addEventListener("input",()=>{{
                 with tempfile.NamedTemporaryFile(
                     dir=destination.parent, delete=False
                 ) as output:
+                    temp_path = output.name
                     while chunk := response.read(1024 * 1024):
                         output.write(chunk)
-                    temp_path = output.name
             Path(temp_path).replace(destination)
             temp_path = None
             self.state.save_file(source_channel, source_ts, file_id, str(destination))
+            self.dirty_conversations.add(Path(destination_channel))
         finally:
             if temp_path:
                 Path(temp_path).unlink(missing_ok=True)
@@ -1135,11 +1177,11 @@ conversationSearch.addEventListener("input",()=>{{
                 path = self.message_path(conversation_dir, source_ts)
                 record = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
                 record["deleted_in_source"] = True
-                path.write_text(
+                self.write_atomic(path,
                     json.dumps(record, indent=2, ensure_ascii=False) + "\n",
-                    encoding="utf-8",
                 )
-                self.write_conversation_html(conversation_dir)
+                self.dirty_conversations.add(conversation_dir)
+                self.flush_html()
             return
         conversation = self.conversation_info(channel)
         message = (
@@ -1157,14 +1199,14 @@ conversationSearch.addEventListener("input",()=>{{
             super().sync_conversation(conversation, refresh=refresh)
         finally:
             self.defer_html = False
-        mapped = self.state.conversation(conversation["id"])
-        if mapped:
-            self.write_conversation_html(Path(mapped["destination_channel"]))
+            self.flush_html()
 
     def sync_all(self, refresh: bool = False) -> None:
         super().sync_all(refresh=refresh)
         if not self.dry_run:
-            self.write_archive_index()
+            self.flush_html()
+            if not (self.archive_dir / "index.html").exists():
+                self.write_archive_index()
 
 
 class CompositeMirror:
@@ -1172,16 +1214,193 @@ class CompositeMirror:
         self.mirrors = mirrors
 
     def sync_all(self, refresh: bool = False) -> None:
+        errors = []
         for mirror in self.mirrors:
-            mirror.sync_all(refresh=refresh)
+            try:
+                mirror.sync_all(refresh=refresh)
+            except Exception as error:
+                errors.append(error)
+        if errors:
+            raise errors[0]
 
-    def sync_new_conversations(self) -> None:
-        for mirror in self.mirrors:
-            mirror.sync_new_conversations()
 
-    def handle_event(self, event: dict[str, Any]) -> None:
-        for mirror in self.mirrors:
-            mirror.handle_event(event)
+class SyncWorker:
+    """One target's resumable work, executed by the single watch thread."""
+
+    def __init__(self, mirror: Mirror, interval: float):
+        self.mirror = mirror
+        self.interval = interval
+        self.events: deque[dict[str, Any]] = deque()
+        self.pending: deque[dict[str, Any]] = deque()
+        self.refresh: deque[dict[str, Any]] = deque()
+        self.scan_at = 0.0
+        self.refresh_at = 0.0
+        self.retry_at = 0.0
+        self.retry_delay = 30.0
+
+    def due(self) -> float:
+        work_at = 0.0 if self.events or self.pending else self.scan_at
+        if self.refresh:
+            work_at = min(work_at, self.refresh_at)
+        return max(self.retry_at, work_at)
+
+    def step(self, now: float) -> None:
+        if now < self.due():
+            return
+        active = None
+        try:
+            if self.events:
+                active = self.events
+                self.mirror.handle_event(active[0])
+            elif self.pending:
+                active = self.pending
+                conversation = active[0]
+                mapped = self.mirror.state.conversation(conversation["id"])
+                self.mirror.sync_conversation(
+                    conversation, refresh=not mapped or mapped["last_history_ts"] is None
+                )
+            elif now >= self.scan_at:
+                conversations = self.mirror.sync_new_conversations()
+                self.pending.extend(conversations)
+                if not self.refresh:
+                    self.refresh.extend(conversations)
+                self.scan_at = now + self.interval
+            else:
+                active = self.refresh
+                conversation = active[0]
+                last = self.mirror.state.get_meta(f"last_refresh:{conversation['id']}")
+                if not last or now - float(last) >= 86400:
+                    self.mirror.sync_conversation(conversation, refresh=True)
+                    # Spread deep-refresh conversations out; never busy-poll.
+                    self.refresh_at = time.time() + 60
+            if active is not None:
+                active.popleft()
+                if active is self.pending and not active:
+                    LOG.info("%s incremental sync complete", type(self.mirror).__name__)
+            self.retry_delay = 30.0
+            self.retry_at = 0.0
+        except Exception as error:
+            response = getattr(error, "response", None)
+            code = response.get("error") if response else None
+            if active is not None and code in {"channel_not_found", "not_in_channel"}:
+                active.popleft()
+                LOG.warning("Skipping an inaccessible conversation (%s)", code)
+                return
+            self.retry_at = time.time() + self.retry_delay
+            LOG.warning("%s sync paused (%s); retrying in %.0fs",
+                        type(self.mirror).__name__, code or type(error).__name__,
+                        self.retry_delay)
+            self.retry_delay = min(self.retry_delay * 2, 300)
+
+
+class LiveConnection:
+    """Keep reconnect policy outside the SDK's rapid automatic retry loop."""
+
+    def __init__(self, client: Any, reconnect: threading.Event):
+        self.client = client
+        self.reconnect = reconnect
+        self.next_at = 0.0
+        self.delay = 30.0
+        self.connected_at: float | None = None
+
+    def step(self, now: float) -> bool:
+        if self.connected_at is not None:
+            if not self.reconnect.is_set() and self.client.is_connected():
+                if now - self.connected_at >= 120:
+                    self.delay = 30.0
+                return False
+            self.client.disconnect()
+            self.connected_at = None
+            self.next_at = now + self.delay
+            self.delay = min(self.delay * 2, 300)
+        if now < self.next_at:
+            return False
+        self.reconnect.clear()
+        try:
+            self.client.wss_uri = None  # Obtain a fresh, short-lived Slack endpoint.
+            self.client.connect()
+        except Exception as error:
+            self.client.disconnect()
+            LOG.warning("Live connection unavailable (%s); retrying in %.0fs",
+                        type(error).__name__, self.delay)
+            self.next_at = time.time() + self.delay
+            self.delay = min(self.delay * 2, 300)
+            return False
+        self.connected_at = time.time()
+        LOG.info("Live connection established; checking for missed messages")
+        return True
+
+
+def watch(mirrors: list[Mirror], source: Any, app_token: str, interval: float) -> None:
+    from slack_sdk.socket_mode import SocketModeClient
+    from slack_sdk.socket_mode.response import SocketModeResponse
+
+    inbox: queue.Queue[dict[str, Any] | None] = queue.Queue()
+    reconnect = threading.Event()
+
+    def request_reconnect(*_: Any) -> None:
+        reconnect.set()
+        inbox.put(None)
+
+    class ManagedSocketClient(SocketModeClient):
+        def connect_to_new_endpoint(self, force: bool = False) -> None:
+            # The SDK also calls this for server-requested connection rotation.
+            request_reconnect()
+
+    client = ManagedSocketClient(
+        app_token=app_token, web_client=source, auto_reconnect_enabled=False,
+        ping_interval=30, concurrency=1,
+        on_error_listeners=[request_reconnect], on_close_listeners=[request_reconnect],
+    )
+
+    def receive(client: Any, request: Any) -> None:
+        if request.type == "events_api":
+            # Queue first: an acknowledgement failure must not discard the event.
+            inbox.put(request.payload.get("event", {}))
+            client.send_socket_mode_response(SocketModeResponse(envelope_id=request.envelope_id))
+
+    client.socket_mode_request_listeners.append(receive)
+    live = LiveConnection(client, reconnect)
+    workers = [SyncWorker(mirror, interval) for mirror in mirrors]
+    LOG.info("Watching: incremental sync every %.0fs; paced daily refresh", interval)
+    try:
+        while True:
+            if live.step(time.time()):
+                for worker in workers:
+                    worker.scan_at = 0
+            # Both live events and history writes run on this thread, never concurrently.
+            for _ in range(100):
+                try:
+                    event = inbox.get_nowait()
+                except queue.Empty:
+                    break
+                if event and event.get("type") == "message":
+                    for worker in workers:
+                        worker.events.append(event)
+            for worker in workers:
+                worker.step(time.time())
+            now = time.time()
+            deadline = min(worker.due() for worker in workers)
+            if live.connected_at is None:
+                deadline = min(deadline, live.next_at)
+            timeout = max(0, min(30, deadline - now))
+            try:
+                event = inbox.get(timeout=timeout)
+                if event and event.get("type") == "message":
+                    for worker in workers:
+                        worker.events.append(event)
+            except queue.Empty:
+                pass
+            if time.time() - now > timeout + 60:
+                # Wall time includes laptop sleep on platforms whose monotonic clock doesn't.
+                request_reconnect()
+                for worker in workers:
+                    worker.scan_at = 0
+    except KeyboardInterrupt:
+        LOG.info("Stopping")
+    finally:
+        client.close()
+        client.current_session_runner.shutdown()
 
 
 def make_client(token: str) -> Any:
@@ -1224,7 +1443,24 @@ def main() -> int:
 
     source_token = require_env("SLACK_SOURCE_USER_TOKEN")
     source = make_client(source_token)
-    source_auth = source.auth_test()
+    interval = float(os.environ.get("SLACK_SYNC_INTERVAL", "900"))
+    if not math.isfinite(interval) or interval <= 0:
+        raise SystemExit("SLACK_SYNC_INTERVAL must be finite and greater than zero.")
+    app_token = require_env("SLACK_SOURCE_APP_TOKEN") if args.mode == "watch" else ""
+    retry_delay = 30
+    while True:
+        try:
+            source_auth = source.auth_test()
+            break
+        except Exception as error:
+            response = getattr(error, "response", None)
+            code = response.get("error") if response else None
+            if args.mode != "watch" or code in {"invalid_auth", "token_revoked", "account_inactive"}:
+                raise
+            LOG.warning("Waiting for Slack (%s); retrying in %ss",
+                        code or type(error).__name__, retry_delay)
+            time.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, 300)
     source_name = source_auth.get("team") or "source Slack"
     conversation_types = os.environ.get("SLACK_MIRROR_TYPES", DEFAULT_TYPES)
     channel_prefix = os.environ.get("SLACK_CHANNEL_PREFIX", "")
@@ -1232,13 +1468,9 @@ def main() -> int:
 
     if target in {"slack", "both"}:
         destination = make_client(require_env("SLACK_DEST_USER_TOKEN"))
-        destination_auth = destination.auth_test()
-        if source_auth["team_id"] == destination_auth["team_id"]:
-            raise SystemExit("Source and destination tokens point to the same workspace.")
         default_db = Path(__file__).with_name("slack-mirror.sqlite3")
         state = State(Path(os.environ.get("SLACK_MIRROR_DB", default_db)))
         state.validate_workspace("source_team_id", source_auth["team_id"])
-        state.validate_workspace("destination_team_id", destination_auth["team_id"])
         mirrors.append(
             Mirror(
                 source=source,
@@ -1252,7 +1484,7 @@ def main() -> int:
                 dry_run=args.mode == "dry-run",
             )
         )
-        LOG.info("Slack target: %s", destination_auth.get("team"))
+        LOG.info("Slack target enabled (validated before copying)")
 
     if target in {"local", "both"}:
         archive_dir = Path(os.environ.get("SLACK_ARCHIVE_DIR", "slack-archive"))
@@ -1264,7 +1496,7 @@ def main() -> int:
         state = State(local_db)
         state.validate_workspace("source_team_id", source_auth["team_id"])
         state.validate_workspace("destination_team_id", f"local:{archive_dir.resolve()}")
-        mirrors.append(
+        mirrors.insert(0,
             LocalArchive(
                 source=source,
                 state=state,
@@ -1287,42 +1519,7 @@ def main() -> int:
         mirror.sync_all(refresh=True)
         return 0
 
-    source_app_token = require_env("SLACK_SOURCE_APP_TOKEN")
-    try:
-        from slack_sdk.socket_mode import SocketModeClient
-        from slack_sdk.socket_mode.response import SocketModeResponse
-    except ModuleNotFoundError as error:
-        raise SystemExit("Socket Mode support is unavailable in slack-sdk") from error
-
-    socket_client = SocketModeClient(app_token=source_app_token, web_client=source)
-
-    def process_socket_request(client: Any, request: Any) -> None:
-        if request.type != "events_api":
-            return
-        client.send_socket_mode_response(SocketModeResponse(envelope_id=request.envelope_id))
-        try:
-            mirror.handle_event(request.payload.get("event", {}))
-        except Exception:
-            LOG.exception("Failed to mirror a Slack event; Slack may redeliver it")
-
-    socket_client.socket_mode_request_listeners.append(process_socket_request)
-    socket_client.connect()
-    LOG.info("Live mirroring is connected. Press Ctrl-C to stop.")
-    mirror.sync_all(refresh=True)
-    rescan_interval = float(os.environ.get("SLACK_RESCAN_INTERVAL", "60"))
-    if rescan_interval <= 0:
-        raise SystemExit("SLACK_RESCAN_INTERVAL must be greater than zero.")
-    stop_event = threading.Event()
-    try:
-        while not stop_event.wait(rescan_interval):
-            try:
-                mirror.sync_new_conversations()
-            except Exception:
-                LOG.exception("Failed to check for new Slack conversations")
-    except KeyboardInterrupt:
-        LOG.info("Stopping")
-    finally:
-        socket_client.disconnect()
+    watch(mirrors, source, app_token, interval)
     return 0
 
 
